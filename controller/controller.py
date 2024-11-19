@@ -3,7 +3,7 @@ from numbers import Real
 from typing import Optional
 
 # Major and minor version of required firmware
-_REQUIRED_FIRMWARE_VERSION = (1, 0)
+_REQUIRED_FIRMWARE_VERSION = (1, 2)
 
 
 class FirmwareVersionMismatch(Exception):
@@ -12,6 +12,16 @@ class FirmwareVersionMismatch(Exception):
 
 class WhoAmIMismatch(Exception):
     pass
+
+
+class Relative:
+    """Opaque structure used to store a reference value for the encoders."""
+
+    def _to_i16(v):
+        v = v & 0xFFFF
+        if v & 0x8000 != 0:
+            v -= 0x10000
+        return v
 
 
 class Controller:
@@ -24,11 +34,14 @@ class Controller:
     CMD_PID_K_P = 0x20
     CMD_PID_K_I = 0x21
     CMD_PID_K_D = 0x22
+    CMD_PID_I_ACCUMULATOR = 0x26
     CMD_MOTOR_SHUTDOWN_TIMEOUT = 0x28
     CMD_RAW_MOTOR_SPEED = 0x30
     CMD_CONTROLLED_MOTOR_SPEED = 0x31
     CMD_ENCODER_TICKS = 0x32
+    CMD_RAW_ENCODER_TICKS = 0x33
     CMD_STATUS = 0x36
+    CMD_COUNTERS = 0x38
     CMD_RESET = 0xE0
     CMD_REBOOT_TO_BOOTLOADER = 0xE1
     CMD_DEVICE_ID = 0xF0
@@ -137,12 +150,54 @@ class Controller:
         sense. Return a pair with left and right data."""
         return self._read(self.CMD_ENCODER_TICKS, 4, "hh")
 
+    def get_raw_encoder_ticks(self) -> tuple[int, int]:
+        """Retrieve the raw encoder ticks as an unsigned absolute 16 bit
+        value with wraparound arithmetic for each encoder. Return a pair
+        with left and right data."""
+        return self._read(self.CMD_RAW_ENCODER_TICKS, 4, "HH")
+
+    def new_relative(self) -> Relative:
+        """Create a reference that can be used to follow the evolution of
+        the number of ticks."""
+        r = Relative
+        r.latest = self.get_raw_encoder_ticks()
+        return r
+
+    def get_relative_encoder_ticks(self, relative: Relative) -> tuple[int, int]:
+        """Compute the number of ticks since the Relative has been created or
+        updated. The Relative object will be updated with the new value.
+
+        A new Relative object can be created using new_relative()."""
+        (prev_left, prev_right) = relative.latest
+        (new_left, new_right) = relative.latest = self.get_raw_encoder_ticks()
+        return (
+            Relative._to_i16(new_left - prev_left),
+            Relative._to_i16(new_right - prev_right),
+        )
+
     def get_status(self) -> dict[str, bool]:
         """Return a dict with status fields:
         - "moving": True if at least one motor is moving, False otherwise
         - "controlled": True if the motors are in controlled mode, False otherwise"""
         (status,) = self._read(self.CMD_STATUS, 1, "B")
         return {"moving": (status & 1) != 0, "controlled": (status & 2) != 0}
+
+    def get_counters(self) -> tuple[int, int, int]:
+        """Return a dict with some counters from the board, wrapped using 256 bit
+        arithmetic:
+        - "btf": the number of BTF events during the hat reception of I²C commands
+        - "unknown_command": the number of unknown I²C command received
+        - "incorrect_processing": the number of known I²C command whose processing
+          returned errors
+        - "emergency_stop": the number of times the watchdog had to stop
+        the moving robot
+        """
+        return dict(
+            zip(
+                ["btf", "unknown_command", "incorrect_processing", "emergency_stop"],
+                self._read(self.CMD_COUNTERS, 4, "BBBB"),
+            )
+        )
 
     def set_motor_shutdown_timeout(self, duration: float):
         """Set the duration in seconds after which the motors will
@@ -199,7 +254,8 @@ class Controller:
         return a | (b << 8) | (c << 16)
 
     def reset(self):
-        """Reset the device. Used mainly for testing."""
+        """Reset the device. Used mainly for testing. Some delay must be respected
+        after sending this command."""
         self._write(self.CMD_RESET, [])
 
     def reset_to_bootloader(self):
@@ -239,6 +295,15 @@ class Controller:
         (k_i,) = self._read(self.CMD_PID_K_I, 4, "<i")
         (k_d,) = self._read(self.CMD_PID_K_D, 4, "<i")
         return (convert(k_p), convert(k_i), convert(k_d))
+
+    def get_pid_i_accumulators(self) -> tuple[float, float]:
+        """Get the PID I accumulators."""
+
+        def convert(v):
+            return v / self.PID_COEFFICIENTS_FACTOR
+
+        (left, right) = self._read(self.CMD_PID_I_ACCUMULATOR, 8, "<ii")
+        return (convert(left), convert(right))
 
     def get_device_family(self) -> Optional[tuple[int, int]]:
         """Return the microcontroller identity and continuation code
